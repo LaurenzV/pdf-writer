@@ -383,6 +383,117 @@ impl Pdf {
         buf.extend(b"\n%%EOF");
         buf.into_vec()
     }
+
+    /// TODO
+    pub fn finish_with_xref_stream(self, xref_id: Ref, hook: Option<Box<dyn FnOnce(&[u8]) -> (Vec<u8>, Filter)>>) -> Vec<u8> {
+        let Chunk { mut buf, mut offsets, write_settings } = self.chunk;
+        let xref_offset = buf.len();
+        offsets.push((xref_id, xref_offset));
+        offsets.sort();
+
+        let xref_len = 1 + offsets.last().unwrap().0.get();
+
+        let field_width = determine_field_width(xref_offset);
+
+        let mut xref_data = Vec::new();
+
+        let mut write_offset = |entry_type: u8, offset: usize, gen_num: u16| {
+            let offset_bytes = (offset as u64).to_be_bytes();
+
+            xref_data.push(entry_type);
+            xref_data.extend(
+                offset_bytes.iter().skip(offset_bytes.len() - field_width as usize),
+            );
+            xref_data.extend_from_slice(&gen_num.to_be_bytes());
+        };
+
+        if offsets.is_empty() {
+            write_offset(0, 0, 65535);
+        }
+
+        // Write entries for all objects
+        let mut written = 0;
+        for (i, (object_id, offset)) in offsets.iter().enumerate() {
+            if written > object_id.get() {
+                panic!("duplicate indirect reference id: {}", object_id.get());
+            }
+
+            // Fill in free list.
+            let start = written;
+            for free_id in start..object_id.get() {
+                let mut next = free_id + 1;
+                if next == object_id.get() {
+                    // Find next free id.
+                    for (used_id, _) in &offsets[i..] {
+                        if next < used_id.get() {
+                            break;
+                        } else {
+                            next = used_id.get() + 1;
+                        }
+                    }
+                }
+
+                let gen = if free_id == 0 { 65535u16 } else { 0 };
+                write_offset(0, next as usize % xref_len as usize, gen);
+                written += 1;
+            }
+
+            write_offset(1, *offset, 0);
+            written += 1;
+        }
+        
+        let (xref_data, filter) = if let Some(hook) = hook {
+            let (xref_data, filter) = hook(&xref_data);
+            (xref_data, Some(filter))
+        }   else {
+            (xref_data, None)
+        };
+
+        let mut stream =
+            Stream::start(Obj::indirect(&mut buf, xref_id, write_settings), &xref_data);
+
+        stream.pair(Name(b"Type"), Name(b"XRef"));
+        stream.pair(Name(b"Size"), xref_len);
+        
+        if let Some(filter) = filter {
+            stream.filter(filter);
+        }
+
+        if let Some(catalog_id) = self.catalog_id {
+            stream.pair(Name(b"Root"), catalog_id);
+        }
+
+        if let Some(info_id) = self.info_id {
+            stream.pair(Name(b"Info"), info_id);
+        }
+
+        if let Some(file_id) = self.file_id {
+            let mut ids = stream.insert(Name(b"ID")).array();
+            ids.item(Str(&file_id.0));
+            ids.item(Str(&file_id.1));
+        }
+
+        stream
+            .insert(Name(b"W"))
+            .array()
+            .item(1)
+            .item(field_width as i32)
+            .item(2);
+
+        stream.finish();
+
+        // Write startxref pointing to the xref stream
+        buf.extend(b"startxref\n");
+        write!(buf.inner, "{}", xref_offset).unwrap();
+
+        // Write EOF marker
+        buf.extend(b"\n%%EOF");
+        buf.into_vec()
+    }
+}
+
+fn determine_field_width(offset: usize) -> u32 {
+    (usize::BITS - offset.leading_zeros()).div_ceil(8)
 }
 
 impl Debug for Pdf {
@@ -530,5 +641,15 @@ mod tests {
             b"trailer\n<<\n  /Size 1\n>>",
             b"startxref\n16\n%%EOF",
         );
+    }
+
+    #[test]
+    fn field_width() {
+        assert_eq!(determine_field_width(128), 1);
+        assert_eq!(determine_field_width(255), 1);
+        assert_eq!(determine_field_width(256), 2);
+        assert_eq!(determine_field_width(u16::MAX as usize), 2);
+        assert_eq!(determine_field_width(u16::MAX as usize + 1), 3);
+        assert_eq!(determine_field_width(u32::MAX as usize), 4);
     }
 }
