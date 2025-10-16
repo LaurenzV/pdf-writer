@@ -207,6 +207,31 @@ use crate::chunk::WriteSettings;
 
 use self::writers::*;
 
+#[derive(Default)]
+struct TrailerData {
+    catalog_id: Option<Ref>,
+    info_id: Option<Ref>,
+    file_id: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl TrailerData {
+    fn write_into_dict(&self, dict: &mut Dict) {
+        if let Some(catalog_id) = self.catalog_id {
+            dict.pair(Name(b"Root"), catalog_id);
+        }
+
+        if let Some(info_id) = self.info_id {
+            dict.pair(Name(b"Info"), info_id);
+        }
+
+        if let Some(file_id) = &self.file_id {
+            let mut ids = dict.insert(Name(b"ID")).array();
+            ids.item(Str(&file_id.0));
+            ids.item(Str(&file_id.1));
+        }
+    }
+}
+
 /// A builder for a PDF file.
 ///
 /// This type constructs a PDF file in-memory. Aside from a few specific
@@ -217,9 +242,7 @@ use self::writers::*;
 /// type dereferences to.
 pub struct Pdf {
     chunk: Chunk,
-    catalog_id: Option<Ref>,
-    info_id: Option<Ref>,
-    file_id: Option<(Vec<u8>, Vec<u8>)>,
+    trailer_data: TrailerData
 }
 
 impl Pdf {
@@ -243,9 +266,7 @@ impl Pdf {
         chunk.buf.extend(b"%PDF-1.7\n%\x80\x80\x80\x80\n\n");
         Self {
             chunk,
-            catalog_id: None,
-            info_id: None,
-            file_id: None,
+            trailer_data: TrailerData::default()
         }
     }
 
@@ -281,7 +302,7 @@ impl Pdf {
     /// the same for a document, the second should change for each revision. It
     /// is optional, but recommended. In PDF/A, this is required. PDF 1.1+.
     pub fn set_file_id(&mut self, id: (Vec<u8>, Vec<u8>)) {
-        self.file_id = Some(id);
+        self.trailer_data.file_id = Some(id);
     }
 
     /// Start writing the document catalog. Required.
@@ -289,7 +310,7 @@ impl Pdf {
     /// This will also register the document catalog with the file trailer,
     /// meaning that you don't need to provide the given `id` anywhere else.
     pub fn catalog(&mut self, id: Ref) -> Catalog<'_> {
-        self.catalog_id = Some(id);
+        self.trailer_data.catalog_id = Some(id);
         self.indirect(id).start()
     }
 
@@ -299,7 +320,7 @@ impl Pdf {
     /// file trailer, meaning that you don't need to provide the given `id`
     /// anywhere else.
     pub fn document_info(&mut self, id: Ref) -> DocumentInfo<'_> {
-        self.info_id = Some(id);
+        self.trailer_data.info_id = Some(id);
         self.indirect(id).start()
     }
 
@@ -309,6 +330,7 @@ impl Pdf {
     /// Panics if any indirect reference id was used twice.
     pub fn finish(self) -> Vec<u8> {
         let Chunk { mut buf, mut offsets, write_settings } = self.chunk;
+        let trailer_data = self.trailer_data;
 
         offsets.sort();
 
@@ -359,19 +381,7 @@ impl Pdf {
         let mut trailer = Obj::direct(&mut buf, 0, write_settings, false).dict();
         trailer.pair(Name(b"Size"), xref_len);
 
-        if let Some(catalog_id) = self.catalog_id {
-            trailer.pair(Name(b"Root"), catalog_id);
-        }
-
-        if let Some(info_id) = self.info_id {
-            trailer.pair(Name(b"Info"), info_id);
-        }
-
-        if let Some(file_id) = self.file_id {
-            let mut ids = trailer.insert(Name(b"ID")).array();
-            ids.item(Str(&file_id.0));
-            ids.item(Str(&file_id.1));
-        }
+        trailer_data.write_into_dict(&mut trailer);
 
         trailer.finish();
 
@@ -387,6 +397,8 @@ impl Pdf {
     /// TODO
     pub fn finish_with_xref_stream(self, xref_id: Ref, hook: Option<Box<dyn FnOnce(&[u8]) -> (Vec<u8>, Filter)>>) -> Vec<u8> {
         let Chunk { mut buf, mut offsets, write_settings } = self.chunk;
+        let trailer_data = self.trailer_data;
+        
         let xref_offset = buf.len();
         offsets.push((xref_id, xref_offset));
         offsets.sort();
@@ -459,19 +471,7 @@ impl Pdf {
             stream.filter(filter);
         }
 
-        if let Some(catalog_id) = self.catalog_id {
-            stream.pair(Name(b"Root"), catalog_id);
-        }
-
-        if let Some(info_id) = self.info_id {
-            stream.pair(Name(b"Info"), info_id);
-        }
-
-        if let Some(file_id) = self.file_id {
-            let mut ids = stream.insert(Name(b"ID")).array();
-            ids.item(Str(&file_id.0));
-            ids.item(Str(&file_id.1));
-        }
+        trailer_data.write_into_dict(stream.deref_mut());
 
         stream
             .insert(Name(b"W"))
