@@ -303,7 +303,6 @@ impl Pdf {
     pub fn finish(self) -> Vec<u8> {
         let Chunk { mut buf, offsets, write_settings } = self.chunk;
         let trailer_data = self.trailer_data;
-
         let xref_offset = buf.len();
 
         let mut writer = PlainXRefWriter::new(&mut buf);
@@ -311,21 +310,11 @@ impl Pdf {
 
         // Write the trailer dictionary.
         buf.extend(b"trailer\n");
-
         let mut trailer = Obj::direct(&mut buf, 0, write_settings, false).dict();
-        trailer.pair(Name(b"Size"), xref_len);
-
-        trailer_data.write_into_dict(&mut trailer);
-
+        trailer_data.write_into_dict(&mut trailer, xref_len);
         trailer.finish();
 
-        // Write where the cross-reference table starts.
-        buf.extend(b"\nstartxref\n");
-        write!(buf.inner, "{xref_offset}").unwrap();
-
-        // Write the end of file marker.
-        buf.extend(b"\n%%EOF");
-        buf.into_vec()
+        finish_trailer(buf, xref_offset)
     }
 
     /// TODO
@@ -337,79 +326,31 @@ impl Pdf {
         let Chunk { mut buf, mut offsets, write_settings } = self.chunk;
         let trailer_data = self.trailer_data;
 
+        // Include the reference of the xref stream in the offsets as well!
         let xref_offset = buf.len();
         offsets.push((xref_id, xref_offset));
-        offsets.sort();
-
-        let xref_len = 1 + offsets.last().unwrap().0.get();
-
         let field_width = determine_field_width(xref_offset);
 
-        let mut xref_data = Vec::new();
-
-        let mut write_offset = |entry_type: u8, offset: usize, gen_num: u16| {
-            let offset_bytes = (offset as u64).to_be_bytes();
-
-            xref_data.push(entry_type);
-            xref_data.extend(
-                offset_bytes.iter().skip(offset_bytes.len() - field_width as usize),
-            );
-            xref_data.extend_from_slice(&gen_num.to_be_bytes());
-        };
-
-        if offsets.is_empty() {
-            write_offset(0, 0, 65535);
-        }
-
-        // Write entries for all objects
-        let mut written = 0;
-        for (i, (object_id, offset)) in offsets.iter().enumerate() {
-            if written > object_id.get() {
-                panic!("duplicate indirect reference id: {}", object_id.get());
-            }
-
-            // Fill in free list.
-            let start = written;
-            for free_id in start..object_id.get() {
-                let mut next = free_id + 1;
-                if next == object_id.get() {
-                    // Find next free id.
-                    for (used_id, _) in &offsets[i..] {
-                        if next < used_id.get() {
-                            break;
-                        } else {
-                            next = used_id.get() + 1;
-                        }
-                    }
-                }
-
-                let gen = if free_id == 0 { 65535u16 } else { 0 };
-                write_offset(0, next as usize % xref_len as usize, gen);
-                written += 1;
-            }
-
-            write_offset(1, *offset, 0);
-            written += 1;
-        }
+        let mut writer = XRefStreamWriter::new(field_width);
+        let xref_len = write_offsets(offsets, &mut writer);
 
         let (xref_data, filter) = if let Some(hook) = hook {
-            let (xref_data, filter) = hook(&xref_data);
+            let (xref_data, filter) = hook(&writer.buf);
             (xref_data, Some(filter))
         } else {
-            (xref_data, None)
+            (writer.buf, None)
         };
 
         let mut stream =
             Stream::start(Obj::indirect(&mut buf, xref_id, write_settings), &xref_data);
 
         stream.pair(Name(b"Type"), Name(b"XRef"));
-        stream.pair(Name(b"Size"), xref_len);
 
         if let Some(filter) = filter {
             stream.filter(filter);
         }
 
-        trailer_data.write_into_dict(stream.deref_mut());
+        trailer_data.write_into_dict(stream.deref_mut(), xref_len);
 
         stream
             .insert(Name(b"W"))
@@ -420,14 +361,18 @@ impl Pdf {
 
         stream.finish();
 
-        // Write startxref pointing to the xref stream
-        buf.extend(b"startxref\n");
-        write!(buf.inner, "{}", xref_offset).unwrap();
-
-        // Write EOF marker
-        buf.extend(b"\n%%EOF");
-        buf.into_vec()
+        finish_trailer(buf, xref_offset)
     }
+}
+
+fn finish_trailer(mut buf: Buf, xref_offset: usize) -> Vec<u8> {
+    // Write startxref pointing to the xref stream
+    buf.extend(b"\nstartxref\n");
+    write!(buf.inner, "{}", xref_offset).unwrap();
+
+    // Write EOF marker
+    buf.extend(b"\n%%EOF");
+    buf.into_vec()
 }
 
 fn write_offsets(mut offsets: Vec<(Ref, usize)>, writer: &mut impl XRefWriter) -> i32 {
@@ -501,7 +446,9 @@ struct TrailerData {
 }
 
 impl TrailerData {
-    fn write_into_dict(&self, dict: &mut Dict) {
+    fn write_into_dict(&self, dict: &mut Dict, xref_len: i32) {
+        dict.pair(Name(b"Size"), xref_len);
+
         if let Some(catalog_id) = self.catalog_id {
             dict.pair(Name(b"Root"), catalog_id);
         }
@@ -522,6 +469,43 @@ trait XRefWriter {
     fn prologue(&mut self, xref_len: i32);
     fn write_free_entry(&mut self, offset: usize, gen_number: u16);
     fn write_occupied_entry(&mut self, offset: usize, gen_number: u16);
+}
+
+struct XRefStreamWriter {
+    buf: Vec<u8>,
+    field_width: u32,
+}
+
+impl XRefStreamWriter {
+    fn new(field_width: u32) -> Self {
+        Self { buf: Vec::new(), field_width }
+    }
+}
+
+impl XRefStreamWriter {
+    fn write(&mut self, entry_type: u8, offset: usize, gen_number: u16) {
+        let offset_bytes = (offset as u64).to_be_bytes();
+
+        self.buf.push(entry_type);
+        self.buf.extend(
+            offset_bytes
+                .iter()
+                .skip(offset_bytes.len() - self.field_width as usize),
+        );
+        self.buf.extend_from_slice(&gen_number.to_be_bytes());
+    }
+}
+
+impl XRefWriter for XRefStreamWriter {
+    fn prologue(&mut self, _: i32) {}
+
+    fn write_free_entry(&mut self, offset: usize, gen_number: u16) {
+        self.write(0, offset, gen_number);
+    }
+
+    fn write_occupied_entry(&mut self, offset: usize, gen_number: u16) {
+        self.write(1, offset, gen_number);
+    }
 }
 
 struct PlainXRefWriter<'a> {
